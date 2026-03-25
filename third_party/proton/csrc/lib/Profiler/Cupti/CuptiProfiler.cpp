@@ -357,6 +357,16 @@ bool isLaunch(CUpti_CallbackId cbId) {
 
 struct CuptiProfiler::CuptiProfilerPimpl
     : public GPUProfiler<CuptiProfiler>::GPUProfilerPimplInterface {
+  struct GraphDebugCounters {
+    std::atomic<uint64_t> handleGraphResourceCallbacks{0};
+    std::atomic<uint64_t> graphLaunchCallbacks{0};
+    std::atomic<uint64_t> graphLaunchMissingGraph{0};
+    std::atomic<uint64_t> graphLaunchFoundUnchecked{0};
+    std::atomic<uint64_t> resetRangeCalls{0};
+    std::atomic<uint64_t> resetRangeTotalNodes{0};
+    std::atomic<uint64_t> resetRangeMaxNodes{0};
+  };
+
   CuptiProfilerPimpl(CuptiProfiler &profiler)
       : GPUProfiler<CuptiProfiler>::GPUProfilerPimplInterface(profiler) {
     auto runtime = &CudaRuntime::instance();
@@ -382,13 +392,66 @@ struct CuptiProfiler::CuptiProfilerPimpl
   static constexpr size_t AlignSize = 8;
   static constexpr size_t AttributeSize = sizeof(size_t);
   static constexpr const char *CaptureTag = "<captured_at>";
+  static constexpr const char *GraphDebugEnv = "PROTON_CUPTI_GRAPH_DEBUG_COUNTERS";
 
   CUpti_SubscriberHandle subscriber{};
   CuptiPCSampling pcSampling;
 
   ThreadSafeMap<uint32_t, GraphState> graphStates;
+  GraphDebugCounters graphDebugCounters;
 
 private:
+  bool graphDebugEnabled() const {
+    static const bool enabled = getBoolEnv(GraphDebugEnv, false);
+    return enabled;
+  }
+
+  void maybeCount(std::atomic<uint64_t> &counter, uint64_t value = 1) {
+    if (!graphDebugEnabled())
+      return;
+    counter.fetch_add(value, std::memory_order_relaxed);
+  }
+
+  void maybeUpdateMax(std::atomic<uint64_t> &counter, uint64_t value) {
+    if (!graphDebugEnabled())
+      return;
+    auto current = counter.load(std::memory_order_relaxed);
+    while (current < value &&
+           !counter.compare_exchange_weak(current, value,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {
+    }
+  }
+
+  void maybeLogGraphDebugCounters(const char *reason) {
+    if (!graphDebugEnabled())
+      return;
+    std::cerr << "[PROTON][CUPTI_GRAPH_DEBUG]"
+              << " reason=" << reason
+              << " handleGraphResourceCallbacks="
+              << graphDebugCounters.handleGraphResourceCallbacks.load(
+                     std::memory_order_relaxed)
+              << " isGraphLaunch="
+              << graphDebugCounters.graphLaunchCallbacks.load(
+                     std::memory_order_relaxed)
+              << " missingGraph="
+              << graphDebugCounters.graphLaunchMissingGraph.load(
+                     std::memory_order_relaxed)
+              << " foundUnchecked="
+              << graphDebugCounters.graphLaunchFoundUnchecked.load(
+                     std::memory_order_relaxed)
+              << " resetRangeCalls="
+              << graphDebugCounters.resetRangeCalls.load(
+                     std::memory_order_relaxed)
+              << " resetRangeTotalNodes="
+              << graphDebugCounters.resetRangeTotalNodes.load(
+                     std::memory_order_relaxed)
+              << " resetRangeMaxNodes="
+              << graphDebugCounters.resetRangeMaxNodes.load(
+                     std::memory_order_relaxed)
+              << std::endl;
+  }
+
   void handleGraphResourceCallbacks(CuptiProfiler &profiler,
                                     CUpti_CallbackId cbId,
                                     CUpti_GraphData *graphData);
@@ -458,6 +521,7 @@ void CuptiProfiler::CuptiProfilerPimpl::completeBuffer(CUcontext ctx,
 void CuptiProfiler::CuptiProfilerPimpl::handleGraphResourceCallbacks(
     CuptiProfiler &profiler, CUpti_CallbackId cbId,
     CUpti_GraphData *graphData) {
+  maybeCount(graphDebugCounters.handleGraphResourceCallbacks);
 
   uint32_t graphId = 0;
   uint32_t graphExecId = 0;
@@ -626,6 +690,7 @@ void CuptiProfiler::CuptiProfilerPimpl::handleApiEnterLaunchCallbacks(
   const auto &scope = threadState.scopeStack.back();
   auto &dataToEntry = threadState.dataToEntry;
   if (isGraphLaunch(cbId)) {
+    maybeCount(graphDebugCounters.graphLaunchCallbacks);
     auto graphExec =
         static_cast<const cuGraphLaunch_params *>(callbackData->functionParams)
             ->hGraph;
@@ -638,6 +703,9 @@ void CuptiProfiler::CuptiProfilerPimpl::handleApiEnterLaunchCallbacks(
         numNodes = graphStates[graphExecId].nodeIdToState.size();
       findGraph = true;
     }
+    if (!findGraph) {
+      maybeCount(graphDebugCounters.graphLaunchMissingGraph);
+    }
     if (!findGraph && !graphStates[graphExecId].captureStatusChecked) {
       graphStates[graphExecId].captureStatusChecked = true;
       std::cerr << "[PROTON] Cannot find graph for graphExecId: " << graphExecId
@@ -645,6 +713,7 @@ void CuptiProfiler::CuptiProfilerPimpl::handleApiEnterLaunchCallbacks(
                    "please start profiling before the graph is created."
                 << std::endl;
     } else if (findGraph && !graphStates[graphExecId].captureStatusChecked) {
+      maybeCount(graphDebugCounters.graphLaunchFoundUnchecked);
       auto &graphState = graphStates[graphExecId];
 
       // For each unique call path, we generate an entry per data object.
@@ -654,6 +723,10 @@ void CuptiProfiler::CuptiProfilerPimpl::handleApiEnterLaunchCallbacks(
       if (!graphState.nodeIdToState.empty()) {
         auto minNodeId = graphState.nodeIdToState.begin()->first;
         auto maxNodeId = graphState.nodeIdToState.rbegin()->first;
+        const auto rangeSize = maxNodeId - minNodeId + 1;
+        maybeCount(graphDebugCounters.resetRangeCalls);
+        maybeCount(graphDebugCounters.resetRangeTotalNodes, rangeSize);
+        maybeUpdateMax(graphDebugCounters.resetRangeMaxNodes, rangeSize);
         graphNodeIdToState.resetRange(minNodeId, maxNodeId);
       } else {
         graphNodeIdToState.clear();
@@ -814,6 +887,7 @@ void CuptiProfiler::CuptiProfilerPimpl::doStop() {
   setLaunchCallbacks(subscriber, /*enable=*/false);
   nvtx::disable();
   setNvtxCallbacks(subscriber, /*enable=*/false);
+  maybeLogGraphDebugCounters("stop");
   cupti::unsubscribe<true>(subscriber);
   cupti::finalize<true>();
 }

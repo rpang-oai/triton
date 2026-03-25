@@ -18,13 +18,16 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <unistd.h>
 
 namespace proton {
 
@@ -426,30 +429,42 @@ private:
   void maybeLogGraphDebugCounters(const char *reason) {
     if (!graphDebugEnabled())
       return;
-    std::cerr << "[PROTON][CUPTI_GRAPH_DEBUG]"
-              << " reason=" << reason
-              << " handleGraphResourceCallbacks="
-              << graphDebugCounters.handleGraphResourceCallbacks.load(
-                     std::memory_order_relaxed)
-              << " isGraphLaunch="
-              << graphDebugCounters.graphLaunchCallbacks.load(
-                     std::memory_order_relaxed)
-              << " missingGraph="
-              << graphDebugCounters.graphLaunchMissingGraph.load(
-                     std::memory_order_relaxed)
-              << " foundUnchecked="
-              << graphDebugCounters.graphLaunchFoundUnchecked.load(
-                     std::memory_order_relaxed)
-              << " resetRangeCalls="
-              << graphDebugCounters.resetRangeCalls.load(
-                     std::memory_order_relaxed)
-              << " resetRangeTotalNodes="
-              << graphDebugCounters.resetRangeTotalNodes.load(
-                     std::memory_order_relaxed)
-              << " resetRangeMaxNodes="
-              << graphDebugCounters.resetRangeMaxNodes.load(
-                     std::memory_order_relaxed)
-              << std::endl;
+    std::ostringstream line;
+    line << "[PROTON][CUPTI_GRAPH_DEBUG]"
+         << " reason=" << reason
+         << " pid=" << getpid()
+         << " handleGraphResourceCallbacks="
+         << graphDebugCounters.handleGraphResourceCallbacks.load(
+                std::memory_order_relaxed)
+         << " isGraphLaunch="
+         << graphDebugCounters.graphLaunchCallbacks.load(
+                std::memory_order_relaxed)
+         << " missingGraph="
+         << graphDebugCounters.graphLaunchMissingGraph.load(
+                std::memory_order_relaxed)
+         << " foundUnchecked="
+         << graphDebugCounters.graphLaunchFoundUnchecked.load(
+                std::memory_order_relaxed)
+         << " resetRangeCalls="
+         << graphDebugCounters.resetRangeCalls.load(
+                std::memory_order_relaxed)
+         << " resetRangeTotalNodes="
+         << graphDebugCounters.resetRangeTotalNodes.load(
+                std::memory_order_relaxed)
+         << " resetRangeMaxNodes="
+         << graphDebugCounters.resetRangeMaxNodes.load(
+                std::memory_order_relaxed);
+
+    std::cerr << line.str() << std::endl;
+    std::cerr.flush();
+
+    const std::string path =
+        "/tmp/proton_cupti_graph_debug." + std::to_string(getpid()) + ".log";
+    std::ofstream out(path, std::ios::app);
+    if (out.is_open()) {
+      out << line.str() << std::endl;
+      out.flush();
+    }
   }
 
   void handleGraphResourceCallbacks(CuptiProfiler &profiler,
